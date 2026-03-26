@@ -1,0 +1,1 @@
+ALTER TABLE public.courses ADD COLUMN contract_url text DEFAULT NULL;
