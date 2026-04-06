@@ -1,237 +1,179 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/hooks/useAuth';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { useToast } from '@/hooks/use-toast';
+import { Loader2, XCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
-  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
-import { useToast } from '@/hooks/use-toast';
-import { Loader2, Calendar, User, Users, XCircle, ChevronLeft, ChevronRight } from 'lucide-react';
-import { DAY_NAMES, type Profile } from '@/lib/types';
-import { format, startOfWeek, addDays, addWeeks, isBefore, differenceInHours, parseISO } from 'date-fns';
-import { ru } from 'date-fns/locale';
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog';
+import { Badge } from '@/components/ui/badge';
+import { startOfWeek, addWeeks, subWeeks, addDays, format, differenceInHours, isBefore } from 'date-fns';
+import { WeeklyScheduleGrid, type GridCellData } from '@/components/schedule/WeeklyScheduleGrid';
 
-interface BookingWithDetails {
-  id: string;
-  student_id: string;
-  schedule_id: string;
-  student_course_id: string | null;
-  booking_date: string;
-  status: string;
-  student_profile?: Profile;
-  schedule_lesson_type?: string;
-}
-
-interface ScheduleSlot {
-  id: string;
-  teacher_id: string;
-  day_of_week: number;
-  start_time: string;
-  end_time: string;
-  lesson_type: string;
-  max_participants: number;
-  is_active: boolean;
-  teacher_name: string;
-}
+interface TeacherInfo { id: string; name: string; }
 
 export function AdminScheduleView() {
   const { user } = useAuth();
   const { toast } = useToast();
   const [loading, setLoading] = useState(true);
-  const [cancelling, setCancelling] = useState<string | null>(null);
-  const [schedules, setSchedules] = useState<ScheduleSlot[]>([]);
-  const [bookings, setBookings] = useState<BookingWithDetails[]>([]);
-  const [selectedTeacher, setSelectedTeacher] = useState<string>('all');
+  const [cellData, setCellData] = useState<Map<string, GridCellData[]>>(new Map());
+  const [weekStart, setWeekStart] = useState(() => startOfWeek(new Date(), { weekStartsOn: 1 }));
+  const [teachers, setTeachers] = useState<TeacherInfo[]>([]);
+  const [selectedTeacher, setSelectedTeacher] = useState('all');
   const [weekOffset, setWeekOffset] = useState(0);
 
-  const weekStart = useMemo(() => {
-    const now = new Date();
-    const start = startOfWeek(now, { weekStartsOn: 1 });
-    return addWeeks(start, weekOffset);
-  }, [weekOffset]);
+  // Cell click dialog
+  const [selectedCell, setSelectedCell] = useState<{ day: number; date: Date; time: string; data: GridCellData[] } | null>(null);
+  const [cancelTarget, setCancelTarget] = useState<{ bookingId: string; studentName: string; scheduleId: string; studentCourseId: string | null; lessonType?: string } | null>(null);
+  const [cancelling, setCancelling] = useState(false);
 
-  const weekDays = useMemo(() =>
-    Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)),
-    [weekStart]
-  );
+  const currentWeekStart = useMemo(() => addWeeks(startOfWeek(new Date(), { weekStartsOn: 1 }), weekOffset), [weekOffset]);
 
-  const fetchData = async () => {
+  const fetchData = useCallback(async () => {
     setLoading(true);
 
-    // Fetch schedules with teacher profiles
+    // Schedules
     const { data: schedData } = await supabase
-      .from('schedules')
-      .select('*')
-      .order('day_of_week')
-      .order('start_time');
+      .from('schedules').select('*').order('day_of_week').order('start_time');
 
-    if (schedData) {
-      const teacherIds = [...new Set(schedData.map(s => s.teacher_id))];
-      const { data: teachers } = await supabase
-        .from('teachers')
-        .select('id, user_id')
-        .in('id', teacherIds);
+    if (!schedData) { setLoading(false); return; }
 
-      const userIds = teachers?.map(t => t.user_id) || [];
-      const { data: profiles } = await supabase
-        .from('profiles')
-        .select('*')
-        .in('user_id', userIds);
+    // Teacher profiles
+    const teacherIds = [...new Set(schedData.map(s => s.teacher_id))];
+    const { data: teacherRows } = await supabase.from('teachers').select('id, user_id').in('id', teacherIds);
+    const userIds = teacherRows?.map(t => t.user_id) || [];
+    const { data: profiles } = await supabase.from('profiles').select('user_id, first_name, last_name').in('user_id', userIds);
+    const profileMap = new Map(profiles?.map(p => [p.user_id, p]) || []);
+    const teacherUserMap = new Map(teacherRows?.map(t => [t.id, t.user_id]) || []);
 
-      const profileMap = new Map(profiles?.map(p => [p.user_id, p]) || []);
-      const teacherUserMap = new Map(teachers?.map(t => [t.id, t.user_id]) || []);
+    const teacherNameMap = new Map<string, string>();
+    teacherIds.forEach(tid => {
+      const uid = teacherUserMap.get(tid);
+      const p = uid ? profileMap.get(uid) : null;
+      teacherNameMap.set(tid, p ? `${p.first_name} ${p.last_name}`.trim() : 'Без имени');
+    });
 
-      setSchedules(schedData.map(s => {
-        const userId = teacherUserMap.get(s.teacher_id);
-        const profile = userId ? profileMap.get(userId) : null;
-        return {
-          ...s,
-          teacher_name: profile ? `${profile.first_name} ${profile.last_name}`.trim() : 'Без имени',
-        };
-      }));
-    }
+    setTeachers(Array.from(teacherNameMap.entries()).map(([id, name]) => ({ id, name })));
 
-    // Fetch bookings for the week
-    const weekEnd = addDays(weekStart, 6);
+    // Bookings for week
+    const weekEnd = addDays(currentWeekStart, 6);
     const { data: bookData } = await supabase
-      .from('bookings')
-      .select('*')
-      .gte('booking_date', format(weekStart, 'yyyy-MM-dd'))
+      .from('bookings').select('*')
+      .gte('booking_date', format(currentWeekStart, 'yyyy-MM-dd'))
       .lte('booking_date', format(weekEnd, 'yyyy-MM-dd'))
       .eq('status', 'confirmed');
 
-    if (bookData && bookData.length > 0) {
-      const studentIds = [...new Set(bookData.map(b => b.student_id))];
-      const { data: studentProfiles } = await supabase
-        .from('profiles')
-        .select('*')
-        .in('user_id', studentIds);
-
-      const spMap = new Map(studentProfiles?.map(p => [p.user_id, p]) || []);
-
-      // Get schedule lesson types
-      const scheduleIds = [...new Set(bookData.map(b => b.schedule_id))];
-      const { data: schedLookup } = await supabase
-        .from('schedules')
-        .select('id, lesson_type')
-        .in('id', scheduleIds);
-      const lessonTypeMap = new Map(schedLookup?.map(s => [s.id, s.lesson_type]) || []);
-
-      setBookings(bookData.map(b => ({
-        ...b,
-        student_profile: spMap.get(b.student_id),
-        schedule_lesson_type: lessonTypeMap.get(b.schedule_id),
-      })));
-    } else {
-      setBookings([]);
+    const studentIds = [...new Set((bookData || []).map(b => b.student_id))];
+    let spMap = new Map<string, { first_name: string; last_name: string; phone: string | null }>();
+    if (studentIds.length > 0) {
+      const { data: sp } = await supabase.from('profiles').select('user_id, first_name, last_name, phone').in('user_id', studentIds);
+      spMap = new Map((sp || []).map(p => [p.user_id, p]));
     }
 
+    // Build grid
+    const map = new Map<string, GridCellData[]>();
+    for (const sched of schedData) {
+      if (!sched.is_active) continue;
+      const timeKey = sched.start_time.slice(0, 5);
+      const key = `${sched.day_of_week}-${timeKey}`;
+      const slotBookings = (bookData || []).filter(b => b.schedule_id === sched.id);
+      const cell: GridCellData = {
+        scheduleId: sched.id,
+        teacherId: sched.teacher_id,
+        teacherName: teacherNameMap.get(sched.teacher_id) || '',
+        lessonType: sched.lesson_type as 'individual' | 'group',
+        maxParticipants: sched.max_participants,
+        isActive: sched.is_active,
+        bookings: slotBookings.map(b => {
+          const p = spMap.get(b.student_id);
+          return {
+            id: b.id,
+            studentName: p ? `${p.first_name} ${p.last_name}`.trim() : 'Ученик',
+            studentPhone: p?.phone,
+            studentCourseId: b.student_course_id,
+          };
+        }),
+      };
+      map.set(key, [...(map.get(key) || []), cell]);
+    }
+
+    setCellData(map);
     setLoading(false);
-  };
+  }, [currentWeekStart]);
 
-  useEffect(() => {
-    fetchData();
-  }, [weekOffset]);
+  useEffect(() => { fetchData(); }, [fetchData]);
 
-  const handleAdminCancel = async (booking: BookingWithDetails) => {
-    if (!user) return;
-    setCancelling(booking.id);
-
-    const schedule = schedules.find(s => s.id === booking.schedule_id);
-    if (!schedule) {
-      toast({ title: 'Ошибка', description: 'Слот не найден', variant: 'destructive' });
-      setCancelling(null);
-      return;
-    }
-
-    // Check if less than 24h before lesson
-    const lessonDateTime = new Date(`${booking.booking_date}T${schedule.start_time}`);
-    const now = new Date();
-    const hoursUntil = differenceInHours(lessonDateTime, now);
-    const penalize = hoursUntil < 24;
-
-    // Cancel the booking
-    const { error: cancelError } = await supabase
-      .from('bookings')
-      .update({
-        status: 'cancelled',
-        cancelled_by: user.id,
-        cancelled_at: new Date().toISOString(),
-      })
-      .eq('id', booking.id);
-
-    if (cancelError) {
-      toast({ title: 'Ошибка', description: cancelError.message, variant: 'destructive' });
-      setCancelling(null);
-      return;
-    }
-
-    // If < 24h, deduct a lesson from student_course
-    if (penalize && booking.student_course_id) {
-      const lessonType = booking.schedule_lesson_type || 'individual';
-      const field = lessonType === 'group' ? 'group_lessons_remaining' : 'individual_lessons_remaining';
-
-      // Get current value
-      const { data: sc } = await supabase
-        .from('student_courses')
-        .select('id, individual_lessons_remaining, group_lessons_remaining, lessons_remaining')
-        .eq('id', booking.student_course_id)
-        .single();
-
-      if (sc) {
-        const currentVal = sc[field] as number;
-        await supabase
-          .from('student_courses')
-          .update({
-            [field]: Math.max(0, currentVal - 1),
-            lessons_remaining: Math.max(0, sc.lessons_remaining - 1),
-          })
-          .eq('id', booking.student_course_id);
-      }
-    }
-
-    toast({
-      title: 'Занятие отменено',
-      description: penalize
-        ? 'Менее 24ч до начала — занятие списано с баланса ученика'
-        : 'Занятие отменено без штрафа',
+  // Filter by teacher
+  const filteredCellData = useMemo(() => {
+    if (selectedTeacher === 'all') return cellData;
+    const filtered = new Map<string, GridCellData[]>();
+    cellData.forEach((cells, key) => {
+      const matching = cells.filter(c => c.teacherId === selectedTeacher);
+      if (matching.length) filtered.set(key, matching);
     });
+    return filtered;
+  }, [cellData, selectedTeacher]);
 
-    setCancelling(null);
-    fetchData();
+  const handleCellClick = (dayOfWeek: number, date: Date, time: string, data: GridCellData[]) => {
+    if (data.length > 0) {
+      setSelectedCell({ day: dayOfWeek, date, time, data });
+    }
   };
 
-  const teachers = useMemo(() => {
-    const map = new Map<string, string>();
-    schedules.forEach(s => map.set(s.teacher_id, s.teacher_name));
-    return Array.from(map.entries()).map(([id, name]) => ({ id, name }));
-  }, [schedules]);
+  const handleCancel = async () => {
+    if (!cancelTarget || !user) return;
+    setCancelling(true);
 
-  const filteredSchedules = useMemo(() =>
-    selectedTeacher === 'all'
-      ? schedules
-      : schedules.filter(s => s.teacher_id === selectedTeacher),
-    [schedules, selectedTeacher]
-  );
+    const { error } = await supabase
+      .from('bookings')
+      .update({ status: 'cancelled', cancelled_by: user.id, cancelled_at: new Date().toISOString() })
+      .eq('id', cancelTarget.bookingId);
+
+    if (error) {
+      toast({ title: 'Ошибка', description: error.message, variant: 'destructive' });
+    } else {
+      // Check penalty
+      if (selectedCell) {
+        const lessonDT = new Date(`${format(selectedCell.date, 'yyyy-MM-dd')}T${selectedCell.time}`);
+        const hoursUntil = differenceInHours(lessonDT, new Date());
+        if (hoursUntil < 24 && cancelTarget.studentCourseId) {
+          const field = cancelTarget.lessonType === 'group' ? 'group_lessons_remaining' : 'individual_lessons_remaining';
+          const { data: sc } = await supabase.from('student_courses')
+            .select('id, individual_lessons_remaining, group_lessons_remaining, lessons_remaining')
+            .eq('id', cancelTarget.studentCourseId).single();
+          if (sc) {
+            await supabase.from('student_courses').update({
+              [field]: Math.max(0, (sc[field] as number) - 1),
+              lessons_remaining: Math.max(0, sc.lessons_remaining - 1),
+            }).eq('id', cancelTarget.studentCourseId);
+          }
+          toast({ title: 'Отменено со штрафом', description: 'Менее 24ч — занятие списано с баланса' });
+        } else {
+          toast({ title: 'Занятие отменено', description: 'Без штрафа' });
+        }
+      }
+      setSelectedCell(null);
+      fetchData();
+    }
+    setCancelling(false);
+    setCancelTarget(null);
+  };
 
   if (loading) {
-    return (
-      <div className="flex items-center justify-center py-12">
-        <Loader2 className="h-8 w-8 animate-spin text-primary" />
-      </div>
-    );
+    return <div className="flex items-center justify-center py-12"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>;
   }
 
   return (
-    <div className="space-y-6">
-      {/* Controls */}
-      <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center justify-between">
+    <div className="space-y-4">
+      <div className="flex items-center gap-3">
         <Select value={selectedTeacher} onValueChange={setSelectedTeacher}>
-          <SelectTrigger className="w-full sm:w-[250px]">
+          <SelectTrigger className="w-[220px]">
             <SelectValue placeholder="Все преподаватели" />
           </SelectTrigger>
           <SelectContent>
@@ -241,131 +183,91 @@ export function AdminScheduleView() {
             ))}
           </SelectContent>
         </Select>
-
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="icon" onClick={() => setWeekOffset(w => w - 1)}>
-            <ChevronLeft className="h-4 w-4" />
-          </Button>
-          <span className="text-sm font-medium whitespace-nowrap">
-            {format(weekStart, 'd MMM', { locale: ru })} — {format(addDays(weekStart, 6), 'd MMM yyyy', { locale: ru })}
-          </span>
-          <Button variant="outline" size="icon" onClick={() => setWeekOffset(w => w + 1)}>
-            <ChevronRight className="h-4 w-4" />
-          </Button>
-          {weekOffset !== 0 && (
-            <Button variant="ghost" size="sm" onClick={() => setWeekOffset(0)}>Сегодня</Button>
-          )}
-        </div>
       </div>
 
-      {/* Schedule cards by day */}
-      {weekDays.map((day, dayIdx) => {
-        const jsDay = day.getDay(); // 0=Sun
-        const daySchedules = filteredSchedules.filter(s => s.day_of_week === jsDay);
-        if (daySchedules.length === 0) return null;
+      <WeeklyScheduleGrid
+        weekStart={currentWeekStart}
+        onPrevWeek={() => setWeekOffset(w => w - 1)}
+        onNextWeek={() => setWeekOffset(w => w + 1)}
+        onToday={() => setWeekOffset(0)}
+        showToday={weekOffset !== 0}
+        cellData={filteredCellData}
+        onCellClick={handleCellClick}
+      />
 
-        const dateStr = format(day, 'yyyy-MM-dd');
+      {/* Cell detail dialog */}
+      <Dialog open={!!selectedCell} onOpenChange={(open) => !open && setSelectedCell(null)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>
+              {selectedCell && `${format(selectedCell.date, 'dd.MM.yyyy')} — ${selectedCell.time}`}
+            </DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 max-h-[400px] overflow-y-auto">
+            {selectedCell?.data.map((cell, ci) => {
+              const lessonDT = selectedCell ? new Date(`${format(selectedCell.date, 'yyyy-MM-dd')}T${selectedCell.time}`) : new Date();
+              const isPast = isBefore(lessonDT, new Date());
 
-        return (
-          <Card key={dayIdx}>
-            <CardHeader className="pb-3">
-              <CardTitle className="text-lg">
-                {DAY_NAMES[jsDay]}, {format(day, 'd MMMM', { locale: ru })}
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {daySchedules.map(schedule => {
-                const slotBookings = bookings.filter(
-                  b => b.schedule_id === schedule.id && b.booking_date === dateStr
-                );
-
-                const lessonDateTime = new Date(`${dateStr}T${schedule.start_time}`);
-                const isPast = isBefore(lessonDateTime, new Date());
-
-                return (
-                  <div key={schedule.id} className="border rounded-lg p-3 space-y-2">
-                    <div className="flex flex-wrap items-center gap-2 justify-between">
-                      <div className="flex items-center gap-2 text-sm font-medium">
-                        <span>{schedule.start_time.slice(0, 5)} — {schedule.end_time.slice(0, 5)}</span>
-                        <span className="text-muted-foreground">·</span>
-                        <span>{schedule.teacher_name}</span>
-                      </div>
-                      <Badge variant={schedule.lesson_type === 'individual' ? 'outline' : 'secondary'}>
-                        {schedule.lesson_type === 'individual' ? (
-                          <><User className="h-3 w-3 mr-1" />Индивид.</>
-                        ) : (
-                          <><Users className="h-3 w-3 mr-1" />Группа</>
-                        )}
-                      </Badge>
-                    </div>
-
-                    {slotBookings.length === 0 ? (
-                      <p className="text-xs text-muted-foreground">Нет записей</p>
-                    ) : (
-                      <div className="space-y-1">
-                        {slotBookings.map(booking => {
-                          const hoursUntil = differenceInHours(lessonDateTime, new Date());
-                          const willPenalize = hoursUntil < 24;
-
-                          return (
-                            <div key={booking.id} className="flex items-center justify-between gap-2 bg-muted/50 rounded px-2 py-1.5">
-                              <span className="text-sm">
-                                {booking.student_profile
-                                  ? `${booking.student_profile.first_name} ${booking.student_profile.last_name}`.trim()
-                                  : 'Ученик'}
-                                {booking.student_profile?.phone && (
-                                  <span className="text-muted-foreground ml-2 text-xs">{booking.student_profile.phone}</span>
-                                )}
-                              </span>
-
-                              {!isPast && (
-                                <AlertDialog>
-                                  <AlertDialogTrigger asChild>
-                                    <Button variant="ghost" size="sm" className="text-destructive h-7 px-2">
-                                      {cancelling === booking.id ? (
-                                        <Loader2 className="h-3 w-3 animate-spin" />
-                                      ) : (
-                                        <><XCircle className="h-3 w-3 mr-1" />Отменить</>
-                                      )}
-                                    </Button>
-                                  </AlertDialogTrigger>
-                                  <AlertDialogContent>
-                                    <AlertDialogHeader>
-                                      <AlertDialogTitle>Отменить занятие?</AlertDialogTitle>
-                                      <AlertDialogDescription>
-                                        {willPenalize
-                                          ? 'До занятия менее 24 часов. Занятие будет списано с баланса ученика.'
-                                          : 'До занятия более 24 часов. Занятие вернётся на баланс ученика.'}
-                                      </AlertDialogDescription>
-                                    </AlertDialogHeader>
-                                    <AlertDialogFooter>
-                                      <AlertDialogCancel>Нет</AlertDialogCancel>
-                                      <AlertDialogAction onClick={() => handleAdminCancel(booking)}>
-                                        Да, отменить
-                                      </AlertDialogAction>
-                                    </AlertDialogFooter>
-                                  </AlertDialogContent>
-                                </AlertDialog>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
+              return (
+                <div key={ci} className="border rounded-lg p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="font-medium text-sm">{cell.teacherName}</span>
+                    <Badge variant={cell.lessonType === 'group' ? 'secondary' : 'outline'}>
+                      {cell.lessonType === 'group' ? 'Групповое' : 'Индивид.'}
+                    </Badge>
                   </div>
-                );
-              })}
-            </CardContent>
-          </Card>
-        );
-      })}
+                  {cell.bookings && cell.bookings.length > 0 ? (
+                    cell.bookings.map((b) => (
+                      <div key={b.id} className="flex items-center justify-between bg-muted/50 rounded px-2 py-1.5">
+                        <div>
+                          <span className="text-sm">{b.studentName}</span>
+                          {b.studentPhone && <span className="text-xs text-muted-foreground ml-2">{b.studentPhone}</span>}
+                        </div>
+                        {!isPast && (
+                          <Button
+                            variant="ghost" size="sm"
+                            className="text-destructive h-7 px-2"
+                            onClick={() => setCancelTarget({
+                              bookingId: b.id,
+                              studentName: b.studentName,
+                              scheduleId: cell.scheduleId!,
+                              studentCourseId: b.studentCourseId || null,
+                              lessonType: cell.lessonType,
+                            })}
+                          >
+                            <XCircle className="h-3 w-3 mr-1" />Отменить
+                          </Button>
+                        )}
+                      </div>
+                    ))
+                  ) : (
+                    <p className="text-sm text-muted-foreground">Нет записей</p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </DialogContent>
+      </Dialog>
 
-      {filteredSchedules.length === 0 && (
-        <div className="text-center py-12 text-muted-foreground">
-          <Calendar className="h-12 w-12 mx-auto mb-4 opacity-50" />
-          <p>Нет слотов расписания</p>
-        </div>
-      )}
+      {/* Cancel confirmation */}
+      <AlertDialog open={!!cancelTarget} onOpenChange={(open) => !open && setCancelTarget(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Отменить занятие?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Отменить запись {cancelTarget?.studentName}?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Нет</AlertDialogCancel>
+            <AlertDialogAction onClick={handleCancel} disabled={cancelling}>
+              {cancelling && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+              Да, отменить
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
